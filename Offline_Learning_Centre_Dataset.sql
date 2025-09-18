@@ -53,6 +53,7 @@ WITH batches as
         batches as b ON bs.batch_id = b.batch_id and b.rn = 1
     WHERE 1=1
         and bs.session_status IN ('completed','cancelled')
+        and b.name <> 'LC-MW-TX-C001-B1111(TEST)' -- exclusive test batch
 )
 
 , session_topic_data as
@@ -127,41 +128,49 @@ WITH batches as
 ,topic_sequence as 
     (
      WITH topic_seq as
-        (
-        Select
-            module_id,
-            grade,
-            module_name,
-            module_status,
-            replace(topic_id,'"','') as topic_id,
-            ROW_NUMBER()OVER(PARTITION BY module_id) as topic_seq
-            from
-                (Select
-                    id as module_id,
-                    grade,
-                    name as module_name,
-                    status as module_status,
-                    replace(json_array_elements(topic_ids)::TEXT,'"','') as topic_id
-                from
-                    etl_bhanzu_analytics.prod_lmsmodule_oc
-                where
-                    status = 'active') as a
-        )
+        (SELECT
+                module_id,
+                grade,
+                module_name,
+                module_status,
+                topic_id,
+                topic_seq
+        FROM
+            (SELECT
+                    c.id as module_id,
+                    c.grade,
+                    c.name as module_name,
+                    c.status as module_status,
+                    t.topic_id,
+                    row_number() OVER (PARTITION BY  c.id ORDER BY t.ordinality) AS topic_seq
+                FROM
+                    etl_bhanzu_analytics.prod_lmsmodule_oc c
+                    CROSS JOIN LATERAL jsonb_array_elements_text(c.topic_ids::jsonb) WITH ORDINALITY t(topic_id, ordinality)
+                WHERE
+                    c.status::text = 'active'::text
+            ) as p
+            )
 
     ,module_seq as
-        (
-        SELECT
-            course_code,
-            replace(module_id,'"','') as module_id,
-            row_number()over(partition by grade) as module_seq
-            FROM
-                    (SELECT
-                        code as course_code,
-                        grade,
-                        json_array_elements(module_ids)::TEXT as module_id
-                    FROM 
-                        etl_bhanzu_analytics.prod_lmscourse_oc) as a
-        )
+            (SELECT
+                f.course_code,
+                f.module_id,
+                f.module_seq
+                
+            FROM 
+                (SELECT 
+                    split_part(c.grade,'-',1) as grade,
+                    t.module_id,
+                    c.batch_type,
+                    btrim(lower(c.code::text)) AS course_code,
+                    row_number() OVER (PARTITION BY c.grade, c.code, c.batch_type ORDER BY t.ordinality) AS module_seq
+                FROM
+                    etl_bhanzu_analytics.prod_lmscourse_oc c
+                    CROSS JOIN LATERAL jsonb_array_elements_text(c.module_ids::jsonb) WITH ORDINALITY t(module_id, ordinality)
+                WHERE
+                    c.status::text = 'active'::text
+                ) as f
+            )
 
         SELECT
             t.*,
@@ -180,7 +189,7 @@ WITH batches as
         t.teacher_id,
         t.trainer_name,
         t.gender as trainer_gender,
-        t.trainer_status,
+        -- t.trainer_status,
         t.joined_on as trainer_joined_on
     FROM
         bhanzu_analytics.prod_trainers_oc as t -- trainer working schedule oc
@@ -322,7 +331,7 @@ SELECT
     sa.student_name as "Student Name",
     sa.student_attendance as "Student Attendance Status",
     sa.attendance_given_on as "Student Attendance Date",
-    sa.is_student_registered as "Is Student Registered",
+    sa.is_student_registered as "Is Student Registered^",
 
     --------------------- batch session columns
     bs.teacher_id as "Teacher Id",
@@ -330,7 +339,7 @@ SELECT
     bs.session_status as "Session Status",
     bs.session_id as "Session Id",
     bs.batch_id as "Batch Id",
-    bs.session_start_time as "Session Start Date",
+    bs.session_start_time as "Lesson Start Date", --- naming it as lesson start date instead of session start date
     bs.session_end_time as "Session End date",
     bs.teacher_join_duration as "Teacher Join Duration",
     bs.topic_id as "Lesson Id",
@@ -345,7 +354,7 @@ SELECT
     bs.cancelled_at       as "Session Cancelled time",
     bs.batch_name         as "Batch Name",
     bs.batch_schedule_start_date as "Batch Scheduled Start Date",
-    bs.batch_actual_start_date as "Batch Actual Start Date",
+    bs.batch_actual_start_date as "Batch Start Date",
     bs.batch_schedule_end_date as "Batch End Date",
     bs.batch_status       as "Batch Status",
     bs.batch_center_name as "Batch Center",
@@ -354,16 +363,16 @@ SELECT
     bs.num_sessions as "Number of Sessions plan",
     bs.batch_strength as "Batch Strength",
     bs.batch_capacity as "Batch Capacity",
-    bs.batch_grade_level as "Batch Grade Level",
+    split_part(bs.batch_grade_level,'-',1) as "Batch Grade",
     ----------------------- topics and module sequence
-    CASE WHEN ws.worksheet_id is not null then 'yes' else 'no' end as "Worksheet Submitted",
+    CASE WHEN ws.worksheet_id is not null then 'yes' else 'no' end as "Worksheet Evaluated",
     ROUND((ws.score/ws.total_marks)*100,0) as "Worksheet Score",
     seq.topic_seq as "Lesson Scheduled Seq",
+    seq.module_seq as "Module Scheduled Seq",
     lm.module_name as "Module Name",
     -----------------------  trainer columns
     t.trainer_name as "Trainer Name",
     t.trainer_gender as "Trainer Gender",
-    t.trainer_status as "Trainer Status",
     t.trainer_joined_on as "Trainer Joined Date",
     
     tc.trainer_total_cancellations as "Trainer Total Cancellations",
@@ -371,7 +380,7 @@ SELECT
 
     ta.teacher_attendance as "Teacher Attendance Status",
     ta.cancelled_at as "Trainer Cancelled At",
-    tpl.leave_status as "Teacher Leave Status" ,
+    tpl.leave_status as "Teacher Leave Status" ,-- not for use
 
     -----------------------   assessment available columns
     aamd.assessment_id as "Available Assessment Id",
@@ -389,6 +398,8 @@ SELECT
     cad.assessment_completed_topic_id as "completed Assessment Lesson Id",
 ----------------------- last refreshed time ist
     get_timestamp_ist(current_timestamp::text) as last_refreshed_at_ist
+
+-- dont use columns "student_registered", "assessments related"
 
 FROM
     batch_sessions bs
